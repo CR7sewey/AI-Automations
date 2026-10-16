@@ -1,0 +1,8 @@
+Prompts for the gmail-cleaner skill
+(Replace the sender names with your own. Claude previews first and waits for your approval before anything goes to Trash.)
+
+- Delete the last 3 months of emails from "Medium Daily Digest".
+- Delete the last 5 emails from "beBee Alertas".
+- Clean up my old promotions: show me everything in the Promotions category older than 30 days, grouped by sender, and flag anything that looks like a receipt or booking.
+- Create a filter so future emails from "Ryanair" skip the inbox and go straight to Trash.
+- I deleted something by mistake: restore the last 3 emails from "TheFork" from Trash.

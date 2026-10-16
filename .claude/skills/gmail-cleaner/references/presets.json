@@ -1,0 +1,11 @@
+{
+  "newsletters": {
+    "description": "Recurring marketing senders confirmed for cleanup. TheFork booking emails (info@email.thefork.pt) and non-digest Medium mail are deliberately NOT matched.",
+    "from": ["buscojobs.com", "info@news.thefork.pt", "Medium Daily Digest"]
+  },
+  "old-promotions": {
+    "description": "Anything Gmail files under Promotions that is older than 30 days. Review the sender summary first: receipts are sometimes mislabelled.",
+    "category": "promotions",
+    "older_than": "30d"
+  }
+}

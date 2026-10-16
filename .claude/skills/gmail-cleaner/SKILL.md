@@ -47,15 +47,30 @@ Shared by `search`, `trash` and `restore`; combined with AND.
 | Flag | Meaning |
 |---|---|
 | `--latest N` | Keep only the **N newest** matches. Fewer or more existing matches is fine. Not a criterion: it still needs one of the flags above. |
-| `--max N` | Safety cap (default 500). `trash`/`restore` with `--apply` refuse when more than N match. Ignored in favour of `--latest` when both are given. |
+| `--oldest N` | Keep only the **N oldest** matches. Same rules as `--latest`; the two cannot be combined. Listing every id to find the oldest is cheap, so it works on huge sets. |
+| `--max N` | Safety cap on how many emails one `trash`/`restore` run may act on (default 500). A bigger match set is refused with `--apply`, and `--latest`/`--oldest` with a count above the cap is refused, so `--oldest 2000` needs `--max 2000` (or more) as an explicit confirmation. `search` is read-only and ignores the cap. |
+
+`--latest`/`--oldest` rely on Gmail listing newest first, which the API docs do not promise; the scripts compare the first and last message dates and abort if the order is wrong.
+
+### Large cleanups
+
+- Gmail's quota page (checked 2026-10) lists 6,000 units/minute per user, with fetching one email's details costing 20, so about 5 emails/s. The client paces itself to that and pauses when Gmail pushes back (giving up after 15 minutes of total pauses), so a sender breakdown of 2,000 emails takes several minutes. Run those in the background.
+- A sender breakdown sampled from the first 500-2000 matches can badly understate the real total. Count first with `trash.mjs ... --no-summary` (dry run, cheap) before agreeing to an approach, and tell the user the real number.
+- `--no-summary` (`trash.mjs` only; `search` and `restore` reject it) skips the per-email detail fetch and prints just the count. Use it to count, or to apply on thousands of emails, **after** the user has seen a sender breakdown. Applying that many needs an explicit `--max` at least as large as the count.
+- Slice a huge cleanup by age (`--older-than 60d --newer-than 1y`) rather than one giant batch; the part closest to what the user reviewed goes first.
+
+### Excluding senders
+
+Add negated terms with `--query`. A value starting with `-` must use the `=` form or Node's parser rejects it: `"--query=-(from:a.com OR from:b.com)"`. Preview what the exclusion keeps with the un-negated query first.
 
 ### Mapping requests to flags
 
 - "Delete the last 3 emails from X" → `--from X --latest 3`
+- "Delete the oldest 2000 old promotions" → `--category promotions --older-than 60d --oldest 2000`
 - "Delete the last 3 months of X" → `--from X --newer-than 3m`
 - "Clean up old promotions" → `--category promotions --older-than 30d`
 
-"Last N emails" (a count) and "last N months" (a time window) are different; ask if the request is ambiguous. For `--latest`, the preview lists the exact messages with ids and dates, so show it and confirm before `--apply`.
+"Last N emails" (a count) and "last N months" (a time window) are different; ask if the request is ambiguous. For `--latest` and `--oldest`, the preview lists the exact messages (add `--list`), so show it and confirm before `--apply`.
 
 ## Scripts
 
@@ -67,7 +82,7 @@ Shared by `search`, `trash` and `restore`; combined with AND.
 | `restore.mjs` | Move matches from Trash back to the inbox | With `--apply` |
 | `filters.mjs` | `list`, `create`, `delete` Gmail filters | `create`/`delete` with `--apply` |
 
-Every script accepts `--help`. `search`, `trash` and `restore` all take `--latest N` and `--max N`; raise `--max` deliberately when a cleanup really should touch more than 500 emails.
+Every script accepts `--help`. `search`, `trash` and `restore` all take `--latest N`, `--oldest N` and `--max N`; raise `--max` deliberately when a cleanup really should touch more than 500 emails.
 
 ## Filters
 

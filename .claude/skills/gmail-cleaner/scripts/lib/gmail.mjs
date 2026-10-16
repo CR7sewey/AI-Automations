@@ -63,29 +63,79 @@ export async function grantedScopes() {
 
 // ---------------------------------------------------------------- REST client
 
+// Gmail's quota page (checked 2026-10) lists 6,000 units/minute/user, with messages.get
+// costing 20 units, i.e. about 5 fetches/s. Pace requests to that, and when Gmail still
+// pushes back make every worker pause together instead of retrying on its own.
+const MIN_INTERVAL_MS = 200;
+const MAX_TOTAL_PAUSE_MS = 15 * 60_000;
+let nextSlot = 0;
+let pausedUntil = 0;
+let totalPausedMs = 0;
+
+async function throttle() {
+  for (;;) {
+    const now = Date.now();
+    if (now < pausedUntil) {
+      await sleep(pausedUntil - now);
+      continue;
+    }
+    const at = Math.max(now, nextSlot);
+    nextSlot = at + MIN_INTERVAL_MS;
+    if (at > now) await sleep(at - now);
+    if (Date.now() >= pausedUntil) return; // a pause may have started while we slept
+  }
+}
+
 export async function api(endpoint, { method = 'GET', query = {}, body } = {}) {
   const url = new URL(API + endpoint);
   for (const [key, value] of Object.entries(query)) {
     for (const item of [].concat(value)) if (item !== undefined) url.searchParams.append(key, item);
   }
+  const idempotent = method === 'GET' || endpoint.endsWith('/batchModify');
+  let refreshed = false;
   for (let attempt = 0; ; attempt++) {
-    const res = await fetch(url, {
-      method,
-      headers: {
-        Authorization: `Bearer ${await accessToken()}`,
-        ...(body && { 'Content-Type': 'application/json' }),
-      },
-      body: body && JSON.stringify(body),
-    });
+    await throttle();
+    let res;
+    try {
+      res = await fetch(url, {
+        method,
+        headers: {
+          Authorization: `Bearer ${await accessToken()}`,
+          ...(body && { 'Content-Type': 'application/json' }),
+        },
+        body: body && JSON.stringify(body),
+      });
+    } catch (err) {
+      if (idempotent && attempt < 4) {
+        await sleep(2 ** attempt * 1000 + Math.random() * 250);
+        continue;
+      }
+      throw new Error(`Gmail API ${method} ${endpoint} failed: ${err.cause?.code ?? err.message}`);
+    }
     if (res.ok) return res.status === 204 ? null : res.json();
 
     const text = await res.text();
-    if (res.status === 401 && attempt === 0) {
+    if (res.status === 401 && !refreshed) {
+      refreshed = true;
       await refreshAccessToken();
       continue;
     }
-    const retryable = res.status === 429 || res.status >= 500 || (res.status === 403 && /rateLimit/i.test(text));
-    if (retryable && attempt < 6) {
+    // 429, or 403 rateLimitExceeded/userRateLimitExceeded. A daily limit will not clear in minutes.
+    const rateLimited = res.status === 429 || (res.status === 403 && /rateLimit|quota/i.test(text));
+    if (rateLimited && !/dailyLimit/i.test(text) && attempt < 8) {
+      const retryAfterMs = Number(res.headers.get('retry-after')) * 1000 || 0;
+      const wait = Math.min(65_000, Math.max(10_000 * (attempt + 1), retryAfterMs));
+      if (Date.now() + wait > pausedUntil) {
+        totalPausedMs += wait;
+        if (totalPausedMs > MAX_TOTAL_PAUSE_MS) {
+          throw new Error('Gmail has rate limited this run for over 15 minutes in total; stopping. Re-run later.');
+        }
+        pausedUntil = Date.now() + wait;
+        console.error(`  rate limited by Gmail, pausing ${Math.round(wait / 1000)}s...`);
+      }
+      continue;
+    }
+    if (res.status >= 500 && attempt < 6) {
       await sleep(2 ** attempt * 1000 + Math.random() * 250);
       continue;
     }
@@ -154,25 +204,74 @@ export const criteriaOptions = {
   preset: { type: 'string' },
 };
 
+const DEFAULT_MAX = 500;
+
 export const limitOptions = {
-  max: { type: 'string', default: '500' },
+  max: { type: 'string' }, // default DEFAULT_MAX; undefined means "not set explicitly"
   latest: { type: 'string' },
+  oldest: { type: 'string' },
 };
 
 /**
- * `--latest N` keeps only the N newest matches (Gmail returns newest first) and is not
- * an error when more exist. `--max N` is a safety cap: acting on more than N is refused.
+ * `--latest N` keeps only the N newest matches, `--oldest N` only the N oldest; neither
+ * is an error when more exist. `--max N` is the safety cap on how many emails one run may
+ * act on (default 500), so a larger --latest/--oldest must be confirmed with a matching
+ * --max. Read-only callers pass `enforceCap: false`.
  */
-export function parseLimit(values) {
+export function parseLimit(values, { enforceCap = true } = {}) {
   const parse = (name, raw) => {
     const n = Number(raw);
     if (!Number.isInteger(n) || n < 1) throw new Error(`--${name} must be a positive integer, got "${raw}".`);
     return n;
   };
-  const max = parse('max', values.max);
-  if (values.latest === undefined) return { max, latest: undefined };
-  const latest = parse('latest', values.latest);
-  return { max: latest, latest };
+  if (values.latest !== undefined && values.oldest !== undefined) {
+    throw new Error('Use either --latest or --oldest, not both.');
+  }
+  const max = values.max === undefined ? DEFAULT_MAX : parse('max', values.max);
+  const latest = values.latest === undefined ? undefined : parse('latest', values.latest);
+  const oldest = values.oldest === undefined ? undefined : parse('oldest', values.oldest);
+  const count = latest ?? oldest;
+  if (enforceCap && count !== undefined && count > max) {
+    const flag = latest ? 'latest' : 'oldest';
+    throw new Error(`--${flag} ${count} exceeds the safety cap --max ${max}. Pass --max ${count} (or higher) to confirm.`);
+  }
+  return { max: count ?? max, latest, oldest, limited: count !== undefined };
+}
+
+/**
+ * messages.list order is not documented; --latest/--oldest assume newest first. Compare the
+ * first and last message dates (2 cheap fetches) and refuse to continue if that is wrong.
+ */
+async function assertNewestFirst(ids) {
+  if (ids.length < 2) return;
+  const dateOf = async (id) => Number((await api(`/messages/${id}`, { query: { format: 'minimal' } })).internalDate);
+  const first = await dateOf(ids[0]);
+  const last = await dateOf(ids[ids.length - 1]);
+  if (first < last) throw new Error('Gmail listed messages oldest-first; --latest/--oldest assume newest-first. Aborting.');
+}
+
+/** Resolve the ids to act on, honouring --latest / --oldest / --max. */
+export async function selectIds(q, { max, latest, oldest }) {
+  if (!oldest) {
+    const found = await listIds(q, max);
+    if (latest) await assertNewestFirst(found.ids);
+    return found;
+  }
+  const { ids } = await listIds(q, Infinity); // listing ids is cheap: 5 units per 500
+  await assertNewestFirst(ids);
+  return { ids: ids.slice(-oldest), truncated: false };
+}
+
+/** Human note about how a limiter shaped the result, shared by every report. */
+export function describeLimit({ latest, oldest, truncated, max }, count) {
+  const n = latest ?? oldest;
+  if (n !== undefined) {
+    const flag = latest ? 'latest' : 'oldest';
+    return count < n
+      ? ` (all ${count} matches, fewer than --${flag} ${n})`
+      : ` (the ${flag} ${n} only${latest ? ', newest first' : ''})`;
+  }
+  return truncated ? ` (more exist beyond --max ${max})` : '';
 }
 
 const quoteIfNeeded = (value) => (/\s/.test(value) && !value.startsWith('"') ? `"${value}"` : value);
@@ -221,13 +320,8 @@ const shortDate = (value) => {
   return Number.isNaN(d.getTime()) ? value : d.toISOString().slice(0, 10);
 };
 
-export function printReport(summaries, { truncated, max, latest, list }) {
-  const note = latest
-    ? ` (the latest ${latest} only, newest first)`
-    : truncated
-      ? ` (more exist beyond --max ${max})`
-      : '';
-  console.log(`Matched ${summaries.length} email(s)${note}`);
+export function printReport(summaries, { truncated, max, latest, oldest, list }) {
+  console.log(`Matched ${summaries.length} email(s)${describeLimit({ latest, oldest, truncated, max }, summaries.length)}`);
   const bySender = new Map();
   for (const s of summaries) {
     const key = address(s.from);
